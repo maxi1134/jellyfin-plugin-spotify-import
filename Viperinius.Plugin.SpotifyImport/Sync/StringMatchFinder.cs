@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Jellyfin.Data.Enums;
+using Jellyfin.Extensions;
 using MediaBrowser.Controller.Entities.Audio;
 using MediaBrowser.Controller.Library;
 using Microsoft.Extensions.Logging;
@@ -40,9 +41,10 @@ namespace Viperinius.Plugin.SpotifyImport.Sync
 
             var artistProviderNextIndex = 0;
             var artistJfNextIndex = 0;
+            List<MediaBrowser.Controller.Entities.BaseItem>? artistJfCandidates = null;
             while (artistProviderNextIndex >= 0)
             {
-                var artist = GetArtist(providerTrackInfo, ref artistProviderNextIndex, ref artistJfNextIndex);
+                var artist = GetArtist(providerTrackInfo, ref artistProviderNextIndex, ref artistJfNextIndex, ref artistJfCandidates);
                 if (artist == null)
                 {
                     LastFailedCriteria |= ItemMatchCriteria.Artists;
@@ -109,7 +111,22 @@ namespace Viperinius.Plugin.SpotifyImport.Sync
             return null;
         }
 
-        private MusicArtist? GetArtist(ProviderTrackInfo providerTrackInfo, ref int nextProviderArtistIndex, ref int nextJfArtistIndex)
+        internal static string GetArtistSearchTerm(string artistName)
+        {
+            // jellyfin removes everything but letters and digits from the search term, so take the first few characters from what is left
+            // (otherwise e.g. "✝✝✝ (Crosses)" results in an empty search term, which matches every artist)
+            var cleanedName = artistName.GetCleanValue();
+            if (string.IsNullOrWhiteSpace(cleanedName))
+            {
+                // nothing searchable left (e.g. "!!!"), keep the previous behaviour
+                return artistName[0..Math.Min(artistName.Length, MaxSearchChars)];
+            }
+
+            // only search for the first few characters to increase the chances of finding artists with slightly differing names between provider and jellyfin
+            return cleanedName[0..Math.Min(cleanedName.Length, MaxSearchChars)];
+        }
+
+        private MusicArtist? GetArtist(ProviderTrackInfo providerTrackInfo, ref int nextProviderArtistIndex, ref int nextJfArtistIndex, ref List<MediaBrowser.Controller.Entities.BaseItem>? jfArtistCandidates)
         {
             var artistName = providerTrackInfo.ArtistNames.ElementAtOrDefault(nextProviderArtistIndex);
             if (string.IsNullOrEmpty(artistName))
@@ -123,18 +140,22 @@ namespace Viperinius.Plugin.SpotifyImport.Sync
                 return null;
             }
 
-            // only search for the first few characters to increase the chances of finding artists with slightly differing names between provider and jellyfin
-            var queryResult = _libraryManager.GetArtists(new MediaBrowser.Controller.Entities.InternalItemsQuery
+            if (jfArtistCandidates == null)
             {
-                SearchTerm = artistName[0..Math.Min(artistName.Length, MaxSearchChars)],
-            });
+                // only query jellyfin once per provider artist, the following calls step through the cached candidates
+                var queryResult = _libraryManager.GetArtists(new MediaBrowser.Controller.Entities.InternalItemsQuery
+                {
+                    SearchTerm = GetArtistSearchTerm(artistName),
+                });
+                jfArtistCandidates = queryResult.Items.Select(i => i.Item).ToList();
+            }
 
-            if (queryResult.Items.Count == nextJfArtistIndex || queryResult.Items.Count == 0)
+            if (jfArtistCandidates.Count == nextJfArtistIndex || jfArtistCandidates.Count == 0)
             {
                 if (Plugin.Instance?.Configuration.EnableVerboseLogging ?? false)
                 {
                     _logger.LogInformation("> Reached end of jellyfin artist list");
-                    if (queryResult.Items.Count == 0)
+                    if (jfArtistCandidates.Count == 0)
                     {
                         _logger.LogInformation("> Did not find any artists for the name {Name}", artistName);
                     }
@@ -142,10 +163,11 @@ namespace Viperinius.Plugin.SpotifyImport.Sync
 
                 nextProviderArtistIndex++;
                 nextJfArtistIndex = 0;
+                jfArtistCandidates = null;
                 return null;
             }
 
-            var (item, _) = queryResult.Items.ElementAt(nextJfArtistIndex);
+            var item = jfArtistCandidates[nextJfArtistIndex];
             nextJfArtistIndex++;
 
             if (item is not MusicArtist artist)
